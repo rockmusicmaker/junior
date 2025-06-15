@@ -4,7 +4,7 @@ use confy;
 use reedline::{DefaultPrompt, DefaultPromptSegment, Reedline, Signal};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Read;
 
 #[derive(Default, Debug, Deserialize, Serialize)]
@@ -22,7 +22,7 @@ fn load_config() -> Result<Config> {
     Ok(config)
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct ChatMessage {
     role: String,
     content: String,
@@ -45,17 +45,12 @@ struct ChatChoice {
     message: ChatMessage,
 }
 
-async fn send_prompt(config: &Config, prompt: &str) -> Result<String> {
+async fn send_prompt(config: &Config, messages: &[ChatMessage]) -> Result<String> {
     let client = Client::new();
-
-    let messages = vec![ChatMessage {
-        role: "user".to_string(),
-        content: prompt.to_string(),
-    }];
 
     let request_body = ChatRequest {
         model: config.model.clone(),
-        messages,
+        messages: messages.to_vec(),
         stream: config.stream,
     };
 
@@ -82,6 +77,15 @@ async fn send_prompt(config: &Config, prompt: &str) -> Result<String> {
         .clone();
 
     Ok(reply)
+}
+
+fn write_history_to_file(history: &[ChatMessage]) -> Result<()> {
+    let history_path = dirs::home_dir()
+        .ok_or(anyhow!("Failed to find home directory"))?
+        .join(".junior-history.json");
+    let json = serde_json::to_string_pretty(history)?;
+    fs::write(history_path, json)?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -115,6 +119,8 @@ async fn main() -> Result<()> {
         file.read_to_string(&mut additional_context)?;
     }
 
+    let mut history: Vec<ChatMessage> = Vec::new();
+
     if prompt.is_empty() {
         let mut line_editor = Reedline::create();
         let prompt = DefaultPrompt::new(
@@ -129,9 +135,18 @@ async fn main() -> Result<()> {
                         break;
                     }
 
-                    let full_prompt = format!("{}\n{}", input, additional_context);
-                    let response = send_prompt(&config, &full_prompt).await?;
+                    history.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: format!("{}\n{}", input, additional_context),
+                    });
+
+                    let response = send_prompt(&config, &history).await?;
                     println!("{}", response);
+                    history.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: response,
+                    });
+                    write_history_to_file(&history)?;
                 }
                 Signal::CtrlD | Signal::CtrlC => {
                     println!("\n👋 lol bye.");
@@ -142,8 +157,19 @@ async fn main() -> Result<()> {
     } else {
         prompt.push_str(&additional_context);
 
-        let response = send_prompt(&config, &prompt).await?;
+        history.push(ChatMessage {
+            role: "user".to_string(),
+            content: prompt.clone(),
+        });
+
+        let response = send_prompt(&config, &history).await?;
+
         println!("{}", response);
+
+        history.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: response,
+        });
     }
 
     Ok(())
