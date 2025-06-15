@@ -6,6 +6,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Read;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Default, Debug, Deserialize, Serialize)]
 struct Config {
@@ -79,12 +81,19 @@ async fn send_prompt(config: &Config, messages: &[ChatMessage]) -> Result<String
     Ok(reply)
 }
 
-fn write_history_to_file(history: &[ChatMessage]) -> Result<()> {
-    let history_path = dirs::home_dir()
+fn session_log_path() -> Result<PathBuf> {
+    let dir = dirs::home_dir()
         .ok_or(anyhow!("Failed to find home directory"))?
-        .join(".junior-history.json");
+        .join(".junior-history");
+    fs::create_dir_all(&dir)?;
+
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    Ok(dir.join(format!("session-{}.json", timestamp)))
+}
+
+fn write_history_to_file(history: &[ChatMessage], path: &PathBuf) -> Result<()> {
     let json = serde_json::to_string_pretty(history)?;
-    fs::write(history_path, json)?;
+    fs::write(path, json)?;
     Ok(())
 }
 
@@ -120,6 +129,7 @@ async fn main() -> Result<()> {
     }
 
     let mut history: Vec<ChatMessage> = Vec::new();
+    let history_path = session_log_path()?;
 
     if prompt.is_empty() {
         let mut line_editor = Reedline::create();
@@ -146,7 +156,7 @@ async fn main() -> Result<()> {
                         role: "assistant".to_string(),
                         content: response,
                     });
-                    write_history_to_file(&history)?;
+                    write_history_to_file(&history, &history_path)?;
                 }
                 Signal::CtrlD | Signal::CtrlC => {
                     println!("\n👋 lol bye.");
