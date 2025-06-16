@@ -1,14 +1,16 @@
 use anyhow::{Result, anyhow};
 use clap::{Arg, Command};
 use confy;
-use reedline::{DefaultPrompt, DefaultPromptSegment, Reedline, Signal};
+use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use shellexpand;
+use std::env;
 use std::fs::{self, File};
-use std::io::Read;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 
 #[derive(Default, Debug, Deserialize, Serialize)]
 struct Config {
@@ -49,6 +51,29 @@ struct ChatChoice {
     message: ChatMessage,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "snake_case")]
+enum ActionType {
+    CreateFile,
+    WriteFile,
+    AppendFile,
+    ReadFile,
+    DeleteFile,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct Action {
+    action_type: ActionType,
+    path: String,
+    content: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ActionSet {
+    explanation: String,
+    actions: Vec<Action>,
+}
+
 fn load_config() -> Result<Configuration> {
     let config_path = dirs::home_dir()
         .ok_or(anyhow!("Failed to find home directory"))?
@@ -72,14 +97,14 @@ fn create_session_file(history_path: &PathBuf) -> Result<PathBuf> {
 
 async fn send_to_llm(
     messages: &[ChatMessage],
-    model: &String,
-    endpoint: &String,
-    api_key: &String,
+    model: &str,
+    endpoint: &str,
+    api_key: &str,
 ) -> Result<String> {
     let client = Client::new();
 
     let request_body = ChatRequest {
-        model: model.clone(),
+        model: model.to_string(),
         messages: messages.to_vec(),
         stream: false,
     };
@@ -161,6 +186,89 @@ fn initialize_history(system_prompt: String, context: Option<String>) -> Result<
     Ok(history)
 }
 
+fn parse_llm_output(output: &String) -> Result<ActionSet> {
+    let code_block_re = Regex::new(r"(?s)```(?:json)?\s*(\{.*?\})\s*```").unwrap();
+    if let Some(captures) = code_block_re.captures(output) {
+        let json_str = captures.get(1).unwrap().as_str();
+        return serde_json::from_str::<ActionSet>(json_str)
+            .map_err(|e| anyhow!("Failed to parse ActionSet JSON from code block: {}", e));
+    }
+
+    if let Some(start) = output.find('{') {
+        let mut brace_count = 0;
+        for (i, ch) in output[start..].char_indices() {
+            match ch {
+                '{' => brace_count += 1,
+                '}' => {
+                    brace_count -= 1;
+                    if brace_count == 0 {
+                        let json_candidate = &output[start..start + i + 1];
+                        return serde_json::from_str::<ActionSet>(json_candidate).map_err(|e| {
+                            anyhow!("Failed to parse ActionSet JSON from loose text: {}", e)
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Err(anyhow!("Could not find a valid JSON object in LLM output"))
+}
+
+fn is_path_safe(path: &str) -> bool {
+    if !path.contains('/') {
+        return true;
+    }
+
+    let current_dir = match env::current_dir() {
+        Ok(dir) => dir,
+        Err(_) => return false,
+    };
+
+    let resolved_path = match Path::new(path).canonicalize() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    resolved_path.starts_with(&current_dir)
+}
+
+async fn create_file(path: &str) -> Result<()> {
+    let mut file = fs::File::create(path)?;
+    file.write_all("".as_bytes())?;
+    Ok(())
+}
+
+fn write_file(path: &str, content: &String) -> Result<()> {
+    let mut file = fs::File::create(path)?;
+    file.write_all(content.as_bytes())?;
+    Ok(())
+}
+
+async fn append_file(path: &str, content: &String) -> Result<()> {
+    use tokio::fs::OpenOptions;
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .await?;
+
+    file.write_all(content.as_bytes()).await?;
+    Ok(())
+}
+
+fn read_file(path: &String) -> Result<String> {
+    let content = fs::read_to_string(path)?;
+    Ok(content)
+}
+
+fn delete_file(path: &String) -> Result<()> {
+    fs::remove_file(path)?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let matches = Command::new("junior")
@@ -171,7 +279,7 @@ async fn main() -> Result<()> {
             Arg::new("prompt")
                 .help("The prompt to send to the LLM")
                 .index(1)
-                .required(false),
+                .required(true),
         )
         .arg(
             Arg::new("file")
@@ -184,7 +292,10 @@ async fn main() -> Result<()> {
 
     let config = load_config()?;
 
-    let prompt: String = matches.get_one("prompt").cloned().unwrap_or_default();
+    let prompt = matches
+        .get_one::<String>("prompt")
+        .map(|s| s.as_str())
+        .unwrap_or("");
     let system_prompt = include_str!("system_prompt.md").to_string();
 
     let mut additional_context: Option<String> = None;
@@ -195,32 +306,54 @@ async fn main() -> Result<()> {
     }
     let mut history = initialize_history(system_prompt, additional_context).unwrap();
 
-    if !prompt.is_empty() {
-        let response = send_message(prompt.clone(), &mut history, &config).await?;
-        println!("{}", response);
-        return Ok(());
-    }
+    let response = send_message(prompt.to_string(), &mut history, &config)
+        .await
+        .unwrap();
+    let action_set = parse_llm_output(&response).unwrap();
 
-    let mut line_editor = Reedline::create();
-    let prompt = DefaultPrompt::new(
-        DefaultPromptSegment::Basic("junior".to_string()),
-        DefaultPromptSegment::Basic("junior".to_string()),
-    );
-    loop {
-        match line_editor.read_line(&prompt)? {
-            Signal::Success(input) => {
-                if input.trim() == "kbye" {
-                    println!("\n👋 lol bye.");
-                    break;
-                }
-                let response = send_message(format!("{}\n", input), &mut history, &config).await?;
-                println!("{}", response);
+    println!("{}", action_set.explanation);
+    for action in action_set.actions {
+        println!("[Action] {:?} on {}", action.action_type, action.path);
+        if !is_path_safe(&action.path) {
+            eprintln!(
+                "❌ Error: Unsafe file path outside current directory: {}",
+                action.path
+            );
+            break;
+        }
+
+        match action.action_type {
+            ActionType::CreateFile => {
+                create_file(&action.path).await?;
             }
-            Signal::CtrlD | Signal::CtrlC => {
-                println!("\n👋 lol bye.");
-                break;
+            ActionType::WriteFile => {
+                if let Some(content) = action.content {
+                    write_file(&action.path, &content)?;
+                } else {
+                    eprintln!(
+                        "⚠️  Error: Action {:?} requires non-empty content, but none was provided for path: {}",
+                        action.action_type, action.path
+                    );
+                }
+            }
+            ActionType::AppendFile => {
+                if let Some(content) = action.content {
+                    append_file(&action.path, &content).await?;
+                } else {
+                    eprintln!(
+                        "⚠️  Error: Action {:?} requires non-empty content, but none was provided for path: {}",
+                        action.action_type, action.path
+                    );
+                }
+            }
+            ActionType::ReadFile => {
+                read_file(&action.path)?;
+            }
+            ActionType::DeleteFile => {
+                delete_file(&action.path)?;
             }
         }
     }
-    return Ok(());
+
+    Ok(())
 }
