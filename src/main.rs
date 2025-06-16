@@ -195,33 +195,32 @@ async fn main() -> Result<()> {
     }
     let mut history = initialize_history(system_prompt, additional_context).unwrap();
 
-    if prompt.is_empty() {
-        let mut line_editor = Reedline::create();
-        let prompt = DefaultPrompt::new(
-            DefaultPromptSegment::Basic("junior".to_string()),
-            DefaultPromptSegment::Basic("junior".to_string()),
-        );
-        loop {
-            match line_editor.read_line(&prompt)? {
-                Signal::Success(input) => {
-                    if input.trim() == "kbye" {
-                        println!("\n👋 lol bye.");
-                        break;
-                    }
-                    let response =
-                        send_message(format!("{}\n", input), &mut history, &config).await?;
-                    println!("{}", response);
-                }
-                Signal::CtrlD | Signal::CtrlC => {
+    if !prompt.is_empty() {
+        let response = send_message(prompt.clone(), &mut history, &config).await?;
+        println!("{}", response);
+        return Ok(());
+    }
+
+    let mut line_editor = Reedline::create();
+    let prompt = DefaultPrompt::new(
+        DefaultPromptSegment::Basic("junior".to_string()),
+        DefaultPromptSegment::Basic("junior".to_string()),
+    );
+    loop {
+        match line_editor.read_line(&prompt)? {
+            Signal::Success(input) => {
+                if input.trim() == "kbye" {
                     println!("\n👋 lol bye.");
                     break;
                 }
+                let response = send_message(format!("{}\n", input), &mut history, &config).await?;
+                println!("{}", response);
+            }
+            Signal::CtrlD | Signal::CtrlC => {
+                println!("\n👋 lol bye.");
+                break;
             }
         }
-    } else {
-        let response = send_message(prompt.clone(), &mut history, &config).await?;
-        println!("{}", response);
     }
-
-    Ok(())
+    return Ok(());
 }
