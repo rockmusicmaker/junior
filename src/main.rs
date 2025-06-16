@@ -4,6 +4,7 @@ use confy;
 use reedline::{DefaultPrompt, DefaultPromptSegment, Reedline, Signal};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use shellexpand;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::PathBuf;
@@ -14,19 +15,20 @@ struct Config {
     api_key: String,
     model: String,
     endpoint: String,
-    stream: bool,
+    history_directory_path: String,
 }
-fn load_config() -> Result<Config> {
-    let config_path = dirs::home_dir()
-        .ok_or(anyhow!("Failed to find home directory"))?
-        .join(".junior.toml");
-    let config: Config = confy::load_path(config_path)?;
-    Ok(config)
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "lowercase")]
+enum Role {
+    System,
+    User,
+    Assistant,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 struct ChatMessage {
-    role: String,
+    role: Role,
     content: String,
 }
 
@@ -47,18 +49,44 @@ struct ChatChoice {
     message: ChatMessage,
 }
 
-async fn send_prompt(config: &Config, messages: &[ChatMessage]) -> Result<String> {
+fn load_config() -> Result<Configuration> {
+    let config_path = dirs::home_dir()
+        .ok_or(anyhow!("Failed to find home directory"))?
+        .join(".junior.toml");
+    let config: Config = confy::load_path(config_path)?;
+    let history_path =
+        PathBuf::from(shellexpand::full(&config.history_directory_path)?.to_string());
+    Ok(Configuration {
+        api_key: config.api_key,
+        endpoint: config.endpoint,
+        log_file: create_session_file(&history_path)?,
+        model: config.model,
+    })
+}
+
+fn create_session_file(history_path: &PathBuf) -> Result<PathBuf> {
+    fs::create_dir_all(&history_path)?;
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    Ok(history_path.join(format!("session-{}.json", timestamp)))
+}
+
+async fn send_to_llm(
+    messages: &[ChatMessage],
+    model: &String,
+    endpoint: &String,
+    api_key: &String,
+) -> Result<String> {
     let client = Client::new();
 
     let request_body = ChatRequest {
-        model: config.model.clone(),
+        model: model.clone(),
         messages: messages.to_vec(),
-        stream: config.stream,
+        stream: false,
     };
 
     let response = client
-        .post(&config.endpoint)
-        .bearer_auth(&config.api_key)
+        .post(endpoint)
+        .bearer_auth(api_key)
         .json(&request_body)
         .send()
         .await?;
@@ -81,27 +109,63 @@ async fn send_prompt(config: &Config, messages: &[ChatMessage]) -> Result<String
     Ok(reply)
 }
 
-fn session_log_path() -> Result<PathBuf> {
-    let dir = dirs::home_dir()
-        .ok_or(anyhow!("Failed to find home directory"))?
-        .join(".junior-history");
-    fs::create_dir_all(&dir)?;
-
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    Ok(dir.join(format!("session-{}.json", timestamp)))
-}
-
-fn write_history_to_file(history: &[ChatMessage], path: &PathBuf) -> Result<()> {
+fn save_messages(history: &[ChatMessage], path: &PathBuf) -> Result<()> {
     let json = serde_json::to_string_pretty(history)?;
     fs::write(path, json)?;
     Ok(())
+}
+
+async fn send_message(
+    message: String,
+    history: &mut Vec<ChatMessage>,
+    options: &Configuration,
+) -> Result<String> {
+    history.push(ChatMessage {
+        role: Role::User,
+        content: message,
+    });
+    save_messages(history, &options.log_file)?;
+    let response =
+        send_to_llm(history, &options.model, &options.endpoint, &options.api_key).await?;
+    history.push(ChatMessage {
+        role: Role::Assistant,
+        content: response.clone(),
+    });
+    save_messages(history, &options.log_file)?;
+    Ok(response)
+}
+
+struct Configuration {
+    model: String,
+    log_file: PathBuf,
+    api_key: String,
+    endpoint: String,
+}
+
+fn initialize_history(system_prompt: String, context: Option<String>) -> Result<Vec<ChatMessage>> {
+    let mut history = Vec::new();
+
+    let system_prompt = ChatMessage {
+        role: Role::System,
+        content: system_prompt,
+    };
+    history.push(system_prompt);
+
+    if let Some(ctx) = context {
+        history.push(ChatMessage {
+            role: Role::User,
+            content: format!("Let's take a look at this together:\n\n{}", ctx),
+        })
+    }
+
+    Ok(history)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let matches = Command::new("junior")
         .version("0.1.0")
-        .author("Your Name")
+        .author("Hunter Horby")
         .about("A CLI interface for LLMs")
         .arg(
             Arg::new("prompt")
@@ -119,17 +183,17 @@ async fn main() -> Result<()> {
         .get_matches();
 
     let config = load_config()?;
-    let mut prompt: String = matches.get_one("prompt").cloned().unwrap_or_default();
 
-    let mut additional_context = String::new();
+    let prompt: String = matches.get_one("prompt").cloned().unwrap_or_default();
+    let system_prompt = include_str!("system_prompt.md").to_string();
 
+    let mut additional_context: Option<String> = None;
     if let Some(file_path) = matches.get_one::<String>("file") {
-        let mut file = File::open(file_path)?;
-        file.read_to_string(&mut additional_context)?;
+        let mut contents = String::new();
+        File::open(file_path)?.read_to_string(&mut contents)?;
+        additional_context = Some(contents);
     }
-
-    let mut history: Vec<ChatMessage> = Vec::new();
-    let history_path = session_log_path()?;
+    let mut history = initialize_history(system_prompt, additional_context).unwrap();
 
     if prompt.is_empty() {
         let mut line_editor = Reedline::create();
@@ -144,19 +208,9 @@ async fn main() -> Result<()> {
                         println!("\n👋 lol bye.");
                         break;
                     }
-
-                    history.push(ChatMessage {
-                        role: "user".to_string(),
-                        content: format!("{}\n{}", input, additional_context),
-                    });
-
-                    let response = send_prompt(&config, &history).await?;
+                    let response =
+                        send_message(format!("{}\n", input), &mut history, &config).await?;
                     println!("{}", response);
-                    history.push(ChatMessage {
-                        role: "assistant".to_string(),
-                        content: response,
-                    });
-                    write_history_to_file(&history, &history_path)?;
                 }
                 Signal::CtrlD | Signal::CtrlC => {
                     println!("\n👋 lol bye.");
@@ -165,21 +219,8 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        prompt.push_str(&additional_context);
-
-        history.push(ChatMessage {
-            role: "user".to_string(),
-            content: prompt.clone(),
-        });
-
-        let response = send_prompt(&config, &history).await?;
-
+        let response = send_message(prompt.clone(), &mut history, &config).await?;
         println!("{}", response);
-
-        history.push(ChatMessage {
-            role: "assistant".to_string(),
-            content: response,
-        });
     }
 
     Ok(())
