@@ -1,16 +1,19 @@
 use anyhow::{Result, anyhow};
 use clap::{Arg, Command};
 use confy;
-use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use shellexpand;
 use std::env;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
+mod tools;
+use tools::tool_definitions;
+
+use crate::tools::{ToolDefinition, tools_registry};
 
 #[derive(Default, Debug, Deserialize, Serialize)]
 struct Config {
@@ -28,17 +31,34 @@ enum Role {
     Assistant,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    tool_type: String,
+    function: FunctionCall,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct FunctionCall {
+    name: String,
+    arguments: String,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct ChatMessage {
     role: Role,
-    content: String,
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Serialize)]
 struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
-    stream: bool,
+    tools: Vec<ToolDefinition>,
+    tool_choice: String,
 }
 
 #[derive(Deserialize)]
@@ -51,27 +71,11 @@ struct ChatChoice {
     message: ChatMessage,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "snake_case")]
-enum ActionType {
-    CreateFile,
-    WriteFile,
-    AppendFile,
-    ReadFile,
-    DeleteFile,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct Action {
-    action_type: ActionType,
-    path: String,
-    content: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct ActionSet {
-    explanation: String,
-    actions: Vec<Action>,
+#[derive(Serialize)]
+struct ChatSessionLog {
+    model: String,
+    tools: Vec<ToolDefinition>,
+    messages: Vec<ChatMessage>,
 }
 
 fn load_config() -> Result<Configuration> {
@@ -100,13 +104,15 @@ async fn send_to_llm(
     model: &str,
     endpoint: &str,
     api_key: &str,
-) -> Result<String> {
+    tool_definitions: &[ToolDefinition],
+) -> Result<ChatMessage> {
     let client = Client::new();
 
     let request_body = ChatRequest {
         model: model.to_string(),
         messages: messages.to_vec(),
-        stream: false,
+        tools: tool_definitions.to_vec(),
+        tool_choice: "auto".to_string(),
     };
 
     let response = client
@@ -123,40 +129,65 @@ async fn send_to_llm(
     }
 
     let response_json: ChatResponse = response.json().await?;
-    let reply = response_json
+    let message = response_json
         .choices
         .get(0)
         .ok_or(anyhow!("No response from model"))?
         .message
-        .content
         .clone();
 
-    Ok(reply)
+    Ok(message)
 }
 
-fn save_messages(history: &[ChatMessage], path: &PathBuf) -> Result<()> {
-    let json = serde_json::to_string_pretty(history)?;
+fn save_log(log: &ChatSessionLog, path: &PathBuf) -> Result<()> {
+    let json = serde_json::to_string_pretty(log)?;
     fs::write(path, json)?;
     Ok(())
 }
 
 async fn send_message(
     message: String,
-    history: &mut Vec<ChatMessage>,
+    log: &mut ChatSessionLog,
     options: &Configuration,
-) -> Result<String> {
-    history.push(ChatMessage {
+    tool_definitions: &[ToolDefinition],
+) -> Result<ChatMessage> {
+    let user_message = ChatMessage {
         role: Role::User,
-        content: message,
-    });
-    save_messages(history, &options.log_file)?;
-    let response =
-        send_to_llm(history, &options.model, &options.endpoint, &options.api_key).await?;
-    history.push(ChatMessage {
-        role: Role::Assistant,
-        content: response.clone(),
-    });
-    save_messages(history, &options.log_file)?;
+        content: Some(message),
+        tool_calls: None,
+    };
+    log.messages.push(user_message.clone());
+    save_log(log, &options.log_file)?;
+
+    let response = send_to_llm(
+        &log.messages,
+        &options.model,
+        &options.endpoint,
+        &options.api_key,
+        tool_definitions,
+    )
+    .await?;
+
+    if let Some(content) = &response.content {
+        let assistant_message = ChatMessage {
+            role: Role::Assistant,
+            content: Some(content.clone()),
+            tool_calls: None,
+        };
+        log.messages.push(assistant_message);
+        save_log(log, &options.log_file)?;
+    }
+
+    if let Some(tool_calls) = &response.tool_calls {
+        let tool_call_message = ChatMessage {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: Some(tool_calls.clone()),
+        };
+        log.messages.push(tool_call_message);
+        save_log(log, &options.log_file)?;
+    }
+
     Ok(response)
 }
 
@@ -167,105 +198,92 @@ struct Configuration {
     endpoint: String,
 }
 
-fn initialize_history(system_prompt: String, context: Option<String>) -> Result<Vec<ChatMessage>> {
+fn initialize_log(
+    system_prompt: String,
+    model: String,
+    tools: &[ToolDefinition],
+    context: Option<String>,
+) -> Result<ChatSessionLog> {
     let mut history = Vec::new();
 
     let system_prompt = ChatMessage {
         role: Role::System,
-        content: system_prompt,
+        content: Some(system_prompt),
+        tool_calls: None,
     };
     history.push(system_prompt);
 
     if let Some(ctx) = context {
         history.push(ChatMessage {
             role: Role::User,
-            content: format!("Let's take a look at this together:\n\n{}", ctx),
+            content: Some(format!("Let's take a look at this together:\n\n{}", ctx)),
+            tool_calls: None,
         })
     }
 
-    Ok(history)
+    Ok(ChatSessionLog {
+        model,
+        tools: tools.to_vec(),
+        messages: history,
+    })
 }
 
-fn parse_llm_output(output: &String) -> Result<ActionSet> {
-    let code_block_re = Regex::new(r"(?s)```(?:json)?\s*(\{.*?\})\s*```").unwrap();
-    if let Some(captures) = code_block_re.captures(output) {
-        let json_str = captures.get(1).unwrap().as_str();
-        return serde_json::from_str::<ActionSet>(json_str)
-            .map_err(|e| anyhow!("Failed to parse ActionSet JSON from code block: {}", e));
+fn sanitize_path_string(path_str: &str) -> String {
+    let path = Path::new(path_str);
+
+    if path.is_absolute() {
+        path_str.to_string()
+    } else if path_str.starts_with("./") || path_str.starts_with("../") {
+        path_str.to_string()
+    } else {
+        format!("./{}", path_str)
+    }
+}
+
+fn sanitize_and_resolve_path(path_str: &str) -> Result<PathBuf> {
+    let current_dir = env::current_dir()?;
+    let full_path = current_dir.join(path_str);
+    let canonical_cwd = current_dir.canonicalize()?;
+    let normalized = full_path.components().collect::<PathBuf>();
+    if !normalized.starts_with(&canonical_cwd) {
+        return Err(anyhow!(
+            "Unsafe path: '{}' is outside of working directory '{}'",
+            normalized.display(),
+            canonical_cwd.display()
+        ));
     }
 
-    if let Some(start) = output.find('{') {
-        let mut brace_count = 0;
-        for (i, ch) in output[start..].char_indices() {
-            match ch {
-                '{' => brace_count += 1,
-                '}' => {
-                    brace_count -= 1;
-                    if brace_count == 0 {
-                        let json_candidate = &output[start..start + i + 1];
-                        return serde_json::from_str::<ActionSet>(json_candidate).map_err(|e| {
-                            anyhow!("Failed to parse ActionSet JSON from loose text: {}", e)
-                        });
-                    }
-                }
-                _ => {}
-            }
+    Ok(normalized)
+}
+
+async fn execute_tool_call(tool_call: &ToolCall) -> Result<()> {
+    let mut args: Value = serde_json::from_str(&tool_call.function.arguments)?;
+
+    println!(
+        "[Tool Call] {} with args: {}",
+        tool_call.function.name, args
+    );
+
+    if let Some(path_str) = args.get("path").and_then(|v| v.as_str()) {
+        let path_str = sanitize_path_string(path_str);
+        let safe_path = sanitize_and_resolve_path(&path_str)?;
+
+        if let Some(obj) = args.as_object_mut() {
+            obj.insert(
+                "path".to_string(),
+                Value::String(safe_path.to_string_lossy().to_string()),
+            );
         }
     }
 
-    Err(anyhow!("Could not find a valid JSON object in LLM output"))
-}
+    let tool = tools_registry()
+        .into_iter()
+        .find(|t| t.name() == tool_call.function.name)
+        .ok_or_else(|| anyhow!("Unknown tool function: {}", tool_call.function.name))?;
 
-fn is_path_safe(path: &str) -> bool {
-    if !path.contains('/') {
-        return true;
-    }
+    let output = tool.call(args).await?;
+    println!("[Tool Output] {}", output);
 
-    let current_dir = match env::current_dir() {
-        Ok(dir) => dir,
-        Err(_) => return false,
-    };
-
-    let resolved_path = match Path::new(path).canonicalize() {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-
-    resolved_path.starts_with(&current_dir)
-}
-
-async fn create_file(path: &str) -> Result<()> {
-    let mut file = fs::File::create(path)?;
-    file.write_all("".as_bytes())?;
-    Ok(())
-}
-
-fn write_file(path: &str, content: &String) -> Result<()> {
-    let mut file = fs::File::create(path)?;
-    file.write_all(content.as_bytes())?;
-    Ok(())
-}
-
-async fn append_file(path: &str, content: &String) -> Result<()> {
-    use tokio::fs::OpenOptions;
-
-    let mut file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)
-        .await?;
-
-    file.write_all(content.as_bytes()).await?;
-    Ok(())
-}
-
-fn read_file(path: &String) -> Result<String> {
-    let content = fs::read_to_string(path)?;
-    Ok(content)
-}
-
-fn delete_file(path: &String) -> Result<()> {
-    fs::remove_file(path)?;
     Ok(())
 }
 
@@ -278,8 +296,7 @@ async fn main() -> Result<()> {
         .arg(
             Arg::new("prompt")
                 .help("The prompt to send to the LLM")
-                .index(1)
-                .required(true),
+                .index(1),
         )
         .arg(
             Arg::new("file")
@@ -297,6 +314,7 @@ async fn main() -> Result<()> {
         .map(|s| s.as_str())
         .unwrap_or("");
     let system_prompt = include_str!("system_prompt.md").to_string();
+    let tool_definitions = tool_definitions();
 
     let mut additional_context: Option<String> = None;
     if let Some(file_path) = matches.get_one::<String>("file") {
@@ -304,53 +322,25 @@ async fn main() -> Result<()> {
         File::open(file_path)?.read_to_string(&mut contents)?;
         additional_context = Some(contents);
     }
-    let mut history = initialize_history(system_prompt, additional_context).unwrap();
+    let mut log = initialize_log(
+        system_prompt.clone(),
+        config.model.clone(),
+        &tool_definitions,
+        additional_context,
+    )
+    .unwrap();
 
-    let response = send_message(prompt.to_string(), &mut history, &config)
-        .await
-        .unwrap();
-    let action_set = parse_llm_output(&response).unwrap();
+    let response = send_message(prompt.to_string(), &mut log, &config, &tool_definitions).await?;
 
-    println!("{}", action_set.explanation);
-    for action in action_set.actions {
-        println!("[Action] {:?} on {}", action.action_type, action.path);
-        if !is_path_safe(&action.path) {
-            eprintln!(
-                "❌ Error: Unsafe file path outside current directory: {}",
-                action.path
-            );
-            break;
-        }
+    if let Some(content) = &response.content {
+        println!("{}", content);
+    }
 
-        match action.action_type {
-            ActionType::CreateFile => {
-                create_file(&action.path).await?;
-            }
-            ActionType::WriteFile => {
-                if let Some(content) = action.content {
-                    write_file(&action.path, &content)?;
-                } else {
-                    eprintln!(
-                        "⚠️  Error: Action {:?} requires non-empty content, but none was provided for path: {}",
-                        action.action_type, action.path
-                    );
-                }
-            }
-            ActionType::AppendFile => {
-                if let Some(content) = action.content {
-                    append_file(&action.path, &content).await?;
-                } else {
-                    eprintln!(
-                        "⚠️  Error: Action {:?} requires non-empty content, but none was provided for path: {}",
-                        action.action_type, action.path
-                    );
-                }
-            }
-            ActionType::ReadFile => {
-                read_file(&action.path)?;
-            }
-            ActionType::DeleteFile => {
-                delete_file(&action.path)?;
+    if let Some(tool_calls) = &response.tool_calls {
+        for tool_call in tool_calls {
+            if let Err(e) = execute_tool_call(tool_call).await {
+                eprintln!("❌ Error executing tool call: {}", e);
+                break;
             }
         }
     }
