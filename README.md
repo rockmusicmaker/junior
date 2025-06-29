@@ -9,7 +9,6 @@ A CLI interface for Large Language Models (LLMs) that can understand prompts and
 - **Session History**: Automatically saves conversation history with timestamps
 - **File Context**: Include file contents in your prompts for AI analysis
 - **Safety Controls**: Restricts file operations to the current directory
-- **Structured Actions**: AI responses are parsed for specific file actions
 
 ## Installation
 
@@ -64,37 +63,14 @@ junior "Analyze this code and suggest improvements" --file main.rs
 junior "Fix the bug in this function" -f src/lib.rs
 ```
 
-## How It Works
-
-1. **Prompt Processing**: Junior sends your prompt to the configured LLM
-2. **AI Response**: The AI analyzes your request and responds with both an explanation and structured actions
-3. **Action Parsing**: Junior parses the AI response for JSON-formatted file operations
-4. **Safe Execution**: Actions are validated and executed within the current directory only
-
-## AI Response Format
-
-The AI is expected to respond with explanations and actions in this JSON format:
-
-```json
-{
-  "explanation": "I'll create a Python hello world script for you.",
-  "actions": [
-    {
-      "action_type": "write_file",
-      "path": "hello.py",
-      "content": "print('Hello, World!')\n"
-    }
-  ]
-}
-```
-
 ### Supported Action Types
-
-- `create_file`: Create an empty file
+- `create_file`: Create an empty file with optional content.
 - `write_file`: Write content to a file (overwrites existing)
 - `append_file`: Append content to a file
 - `read_file`: Read file contents
 - `delete_file`: Delete a file
+- `create_dir`: Create a new directory
+- `move_file`: Move or rename a file
 
 ## Session History
 
@@ -133,14 +109,3 @@ junior "Review this code for bugs and fix them" --file buggy-script.py
 ```bash
 junior "Generate comprehensive documentation for this module" --file src/main.rs
 ```
-
-## Dependencies
-
-- `anyhow`: Error handling
-- `clap`: Command-line argument parsing
-- `confy`: Configuration file management
-- `regex`: Regular expression support
-- `reqwest`: HTTP client for API calls
-- `serde`: Serialization/deserialization
-- `shellexpand`: Shell-style path expansion
-- `tokio`: Async runtime
